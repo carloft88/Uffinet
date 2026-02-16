@@ -1,0 +1,174 @@
+trigger: none
+
+pool:
+  vmImage: 'windows-latest'
+
+variables:
+  DB_NAME: 'db-datahub-pro-01'
+  SQL_CONNECTION_STRING: 'Server=sql-ironhub-pro-01.database.windows.net,1433;Database=$(DB_NAME);User ID=usuario;Password=$(SQL_PASSWORD);Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;'
+  OUTPUT_FOLDER: 'artifacts'         # (no se usa; se mantiene por compatibilidad)
+  OUTPUT_FILE: 'tablas_temp_tmp.csv' # (no se usa; se mantiene por compatibilidad)
+  MAIL_TO: 'ccastrillonc@Ufinet.com' # separados por coma si hay varios
+  MAIL_FROM: 'ccastrillonc@Ufinet.com'
+  MAIL_SUBJECT: 'Reporte tablas TEMP/TMP - $(DB_NAME)'
+
+steps:
+  # 1) Instalar módulo SqlServer (para Invoke-Sqlcmd)
+  - task: PowerShell@2
+    displayName: 'Preparar entorno (instalar módulo SqlServer)'
+    inputs:
+      targetType: 'inline'
+      script: |
+        $ErrorActionPreference = 'Stop'
+        $ProgressPreference = 'SilentlyContinue'
+
+        # Asegurar TLS 1.2 para instalar módulo si hace falta
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+        $mod = Get-Module -ListAvailable SqlServer | Sort-Object Version -Descending | Select-Object -First 1
+        if (-not $mod) {
+          Write-Host "Instalando módulo SqlServer..."
+          Install-Module SqlServer -Scope CurrentUser -Force -AllowClobber
+        } else {
+          Write-Host "Módulo SqlServer ya disponible: $($mod.Version)"
+        }
+
+  # 2) Ejecutar query y construir HTML (sin CSV)
+  - task: PowerShell@2
+    displayName: 'Query SQL (SQL Auth) y construir HTML (cuerpo de correo)'
+    env:
+      SQL_PASSWORD: $(SQL_PASSWORD)      # secreta
+    inputs:
+      targetType: 'inline'
+      script: |
+        $ErrorActionPreference = 'Stop'
+        Import-Module SqlServer -ErrorAction Stop
+
+        # --- Parsear la cadena de conexión para extraer Server/DB/Usuario ---
+        $conn = "$(SQL_CONNECTION_STRING)"
+        if ([string]::IsNullOrWhiteSpace($conn)) { throw "SQL_CONNECTION_STRING está vacío." }
+
+        $map = @{}
+        foreach ($part in $conn.Split(';')) {
+          if ($part -match '=') {
+            $kv = $part.Split('=')
+            $k = $kv[0].Trim().ToLowerInvariant()
+            $v = ($kv[1..($kv.Length-1)] -join '=').Trim()
+            if ($k) { $map[$k] = $v }
+          }
+        }
+
+        $server   = $map['server']
+        $database = $map['database']
+        $username = $map['user id']
+        if ([string]::IsNullOrWhiteSpace($server))   { throw "No se pudo leer 'Server' de SQL_CONNECTION_STRING." }
+        if ([string]::IsNullOrWhiteSpace($database)) { $database = "$(DB_NAME)" } # por si viene como $(DB_NAME)
+        if ([string]::IsNullOrWhiteSpace($username)) { throw "No se pudo leer 'User ID' de SQL_CONNECTION_STRING." }
+
+        $password = $env:SQL_PASSWORD
+        if ([string]::IsNullOrWhiteSpace($password)) { throw "La variable secreta SQL_PASSWORD no está definida." }
+
+        # --- Query ---
+        $query = @"
+SET NOCOUNT ON;
+SELECT
+    s.name AS schema_name,
+    t.name AS table_name,
+    SUM(p.rows) AS row_count
+FROM sys.tables t
+JOIN sys.schemas s ON t.schema_id = s.schema_id
+LEFT JOIN sys.partitions p
+       ON p.object_id = t.object_id
+      AND p.index_id IN (0,1)
+WHERE t.is_ms_shipped = 0
+  AND (t.name LIKE '%temp%' OR t.name LIKE '%tmp%')
+GROUP BY s.name, t.name
+ORDER BY row_count DESC, s.name, t.name;
+"@
+
+        # --- Ejecutar con SQL Auth ---
+        $rows = Invoke-Sqlcmd -ServerInstance $server -Database $database -Username $username -Password $password -Query $query -ErrorAction Stop
+
+        # Métricas
+        $totalTablas = 0
+        $totalFilas  = 0
+        if ($rows) {
+          $totalTablas = ($rows | Measure-Object).Count
+          $totalFilas  = (($rows | Measure-Object -Sum row_count).Sum)
+        }
+
+        # Si no hay filas, incluir una fila informativa
+        if (-not $rows -or $rows.Count -eq 0) {
+          $rows = @([pscustomobject]@{ schema_name = '(sin coincidencias)'; table_name=''; row_count=0 })
+        }
+
+        # --- Construir HTML ---
+        $style = @"
+<style>
+  body { font-family: Segoe UI, Arial, sans-serif; color:#222; }
+  h2 { margin: 0 0 8px 0; }
+  .meta { font-size:12px; color:#555; margin-bottom:12px; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border: 1px solid #ddd; padding: 6px 8px; font-size: 13px; }
+  th { background:#f2f2f2; text-align:left; }
+  tr:nth-child(even) { background:#fafafa; }
+</style>
+"@
+
+        $header = "<h2>Reporte de tablas 'temp'/'tmp' – $database</h2>"
+        $meta   = "<div class='meta'>
+          Generado: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')<br/>
+          Servidor: $server<br/>
+          Total tablas: $totalTablas<br/>
+          Total filas (suma): $totalFilas
+        </div>"
+
+        # Tabla principal
+        $table = $rows | Select-Object schema_name, table_name, row_count | ConvertTo-Html -Fragment | Out-String
+
+        $htmlBody = "<html><head>$style</head><body>$header$meta$table</body></html>"
+
+        # Guardar en archivo temporal (para pasarlo al siguiente paso sin truncar)
+        $env:HTML_BODY_PATH = "$(Agent.TempDirectory)\mail_body.html"
+        Set-Content -Path $env:HTML_BODY_PATH -Value $htmlBody -Encoding UTF8
+        Write-Host "##vso[task.setvariable variable=HTML_BODY_PATH;isOutput=true]$($env:HTML_BODY_PATH)"
+        Write-Host "HTML listo."
+
+  # 3) Enviar correo con SendGrid (HTML en el cuerpo, sin adjuntos)
+  - task: PowerShell@2
+    displayName: 'Enviar correo (SendGrid) – cuerpo HTML'
+    env:
+      SENDGRID_API_KEY: $(SENDGRID_API_KEY)  # secreta
+    inputs:
+      targetType: 'inline'
+      script: |
+        $ErrorActionPreference = 'Stop'
+
+        $htmlPath = "$(HTML_BODY_PATH)"
+        if (-not (Test-Path $htmlPath)) {
+          throw "No se encontró el cuerpo HTML en $htmlPath"
+        }
+        $htmlBody = Get-Content -Path $htmlPath -Raw -Encoding UTF8
+
+        # Construir payload SendGrid con HTML
+        $toList = @()
+        foreach ($addr in "$(MAIL_TO)".Split(',')) {
+          $trim = $addr.Trim()
+          if ($trim) { $toList += @{ email = $trim } }
+        }
+
+        if ($toList.Count -eq 0) { throw "MAIL_TO está vacío." }
+
+        $payload = @{
+          personalizations = @(@{ to = $toList; subject = "$(MAIL_SUBJECT)" })
+          from = @{ email = "$(MAIL_FROM)" }
+          content = @(@{ type = "text/html"; value = $htmlBody })
+        } | ConvertTo-Json -Depth 10
+
+        $headers = @{
+          "Authorization" = "Bearer $env:SENDGRID_API_KEY"
+          "Content-Type"  = "application/json"
+        }
+
+        Invoke-RestMethod -Method Post -Uri "https://api.sendgrid.com/v3/mail/send" -Headers $headers -Body $payload
+        Write-Host "Correo enviado (HTML en el cuerpo)."
