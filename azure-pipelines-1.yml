@@ -1,0 +1,146 @@
+# azure-pipelines.yml
+trigger: none  # correr manualmente o setear ramas
+
+pool:
+  vmImage: 'windows-latest'
+
+variables:
+  DB_NAME: 'db-datahub-pro-01'
+  SQL_CONNECTION_STRING: 'Server=sql-ironhub-pro-01.database.windows.net,1433;Database=$(DB_NAME);User ID=usuario;Password=$(SQL_PASSWORD);Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;'
+  OUTPUT_FOLDER: 'artifacts'
+  OUTPUT_FILE: 'tablas_temp_tmp.csv'
+  MAIL_TO: 'ccastrillonc@Ufinet.com'     # separado por coma si hay varios
+  MAIL_FROM: 'ccastrillonc@Ufinet.com'
+  MAIL_SUBJECT: 'Reporte tablas TEMP/TMP - $(DB_NAME)'
+
+  # Query en una sola línea para pasarlo a sqlcmd
+  SQL_QUERY: >
+    SET NOCOUNT ON;
+    SELECT s.name AS schema_name, t.name AS table_name, SUM(p.rows) AS row_count
+    FROM sys.tables t
+    JOIN sys.schemas s ON t.schema_id = s.schema_id
+    LEFT JOIN sys.partitions p ON p.object_id = t.object_id AND p.index_id IN (0,1)
+    WHERE t.is_ms_shipped = 0 AND (t.name LIKE '%temp%' OR t.name LIKE '%tmp%')
+    GROUP BY s.name, t.name
+    ORDER BY row_count DESC, s.name, t.name;
+
+steps:
+  - task: PowerShell@2
+    displayName: 'Instalar sqlcmd (si no existe)'
+    inputs:
+      targetType: 'inline'
+      script: |
+        # En hosted agents modernos suele estar sqlcmd. Si no, instalar con winget/choco.
+        $exists = Get-Command sqlcmd -ErrorAction SilentlyContinue
+        if (-not $exists) {
+          Write-Host "sqlcmd no encontrado. Intentando instalar con winget..."
+          try {
+            winget install -e --id Microsoft.SQLCmd --accept-package-agreements --accept-source-agreements
+          } catch {
+            Write-Warning "No se pudo instalar sqlcmd automáticamente. Si falla el paso siguiente, instala la herramienta en tu agente."
+          }
+        } else {
+          Write-Host "sqlcmd está disponible."
+        }
+
+  - task: PowerShell@2
+    displayName: 'Ejecutar query y exportar a CSV'
+    env:
+      SQL_PASSWORD: $(SQL_PASSWORD)     # Define esta variable secreta en el pipeline
+    inputs:
+      targetType: 'inline'
+      script: |
+        $ErrorActionPreference = 'Stop'
+        New-Item -ItemType Directory -Force -Path "$(OUTPUT_FOLDER)" | Out-Null
+        $tmpFile = Join-Path "$(OUTPUT_FOLDER)" "resultado_raw.txt"
+        $csvFile = Join-Path "$(OUTPUT_FOLDER)" "$(OUTPUT_FILE)"
+
+        # Ejecutar sqlcmd y sacar delimitado por tabulador
+        sqlcmd -S tcp: -C -d "$(DB_NAME)" -Q "$(SQL_QUERY)" -b -W -s "    " -u -e -E 2>$null
+
+        # Si usas cadena de conexión:
+        # sqlcmd -C -S tcp: -d "$(DB_NAME)" -Q "$(SQL_QUERY)" -b -W -s "    " -u -e -U "usuario" -P "$env:SQL_PASSWORD" > $tmpFile
+
+        # Alternativa robusta usando cadena completa:
+        # sqlcmd -C -Q "$(SQL_QUERY)" -b -W -s "    " -u -e -K ReadOnly -S "tcp:tu-servidor-sql.database.windows.net,1433" -d "$(DB_NAME)" -U "usuario" -P "$env:SQL_PASSWORD" > $tmpFile
+
+        # Para este ejemplo, usaré cadena de conexión con sqlcmd vía ODBC no es directo.
+        # Si arriba ya redirigiste a $tmpFile, comenta esta línea y deja ese flujo.
+        # Simularemos que el output cayó en $tmpFile
+        # (Quita esta simulación cuando uses la línea sqlcmd > $tmpFile)
+        # #########################
+        # Remove-Item $tmpFile -ErrorAction SilentlyContinue
+        # "schema_name`ttable_name`trow_count" | Out-File -FilePath $tmpFile -Encoding UTF8
+        # #########################
+
+        # Convertir tab-delimited a CSV
+        # Nota: si ya generaste con -s "," podrías saltarte esto
+        $lines = Get-Content $tmpFile | Where-Object { $_.Trim() -ne "" } 
+        if ($lines.Count -eq 0) {
+          Write-Host "No hay resultados del query."
+          "schema_name,table_name,row_count" | Out-File -FilePath $csvFile -Encoding UTF8
+        } else {
+          # Detectar encabezado y contenidos
+          $header = $lines[0].Split("`t")
+          $objects = foreach ($ln in $lines | Select-Object -Skip 1) {
+            $cols = $ln.Split("`t")
+            [PSCustomObject]@{
+              schema_name = $cols[0]
+              table_name  = $cols[1]
+              row_count   = [int64]$cols[2]
+            }
+          }
+          $objects | Export-Csv -Path $csvFile -NoTypeInformation -Encoding UTF8
+        }
+        Write-Host "CSV generado: $csvFile"
+        Write-Host "##vso[task.setvariable variable=CSV_PATH;isOutput=true]$csvFile"
+
+  - task: PowerShell@2
+    displayName: 'Enviar email con SendGrid (adjunto CSV)'
+    env:
+      SENDGRID_API_KEY: $(SENDGRID_API_KEY)   # Variable secreta
+    inputs:
+      targetType: 'inline'
+      script: |
+        $ErrorActionPreference = 'Stop'
+        $csvPath = "$(OUTPUT_FOLDER)\$(OUTPUT_FILE)"
+        if (-not (Test-Path $csvPath)) {
+          throw "No se encontró el archivo CSV en $csvPath"
+        }
+
+        $bytes = [System.IO.File]::ReadAllBytes($csvPath)
+        $content = [System.Convert]::ToBase64String($bytes)
+
+        $body = @{
+          personalizations = @(
+            @{
+              to = @(
+                foreach ($addr in "$(MAIL_TO)".Split(',')) { @{ email = $addr.Trim() } }
+              )
+              subject = "$(MAIL_SUBJECT)"
+            }
+          )
+          from = @{ email = "$(MAIL_FROM)" }
+          content = @(
+            @{
+              type = "text/plain"
+              value = "Adjunto el reporte de tablas con 'temp'/'tmp' para la base $(DB_NAME)."
+            }
+          )
+          attachments = @(
+            @{
+              content = $content
+              type    = "text/csv"
+              filename= "$(OUTPUT_FILE)"
+              disposition = "attachment"
+            }
+          )
+        } | ConvertTo-Json -Depth 10
+
+        $headers = @{
+          "Authorization" = "Bearer $env:SENDGRID_API_KEY"
+          "Content-Type"  = "application/json"
+        }
+
+        $response = Invoke-RestMethod -Method Post -Uri "https://api.sendgrid.com/v3/mail/send" -Headers $headers -Body $body
+        Write-Host "Correo enviado vía SendGrid."
