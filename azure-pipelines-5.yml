@@ -1,0 +1,41 @@
+trigger: none  # Manual o schedule
+
+pool:
+  vmImage: 'windows-latest'
+
+variables:
+  serverName: 'sql-ironhub-pro-01.database.windows.net'  # Azure SQL
+  databaseName: 'db-datahub-pro-01'
+  emailTo: 'ccastrillonc@Ufinet.com'
+  smtpServer: 'smtp.office365.com'
+  smtpPort: 587
+  smtpUser: 'ccastrillonc@Ufinet.com'
+  smtpPass: '$(smtpPassword)'  # Variable secreta en Library
+
+steps:
+- task: PowerShell@2
+  displayName: 'Ejecutar query y enviar email'
+  env:
+    SMTP_PASS: $(smtpPassword)
+  inputs:
+    targetType: 'inline'
+    script: |
+      # Instalar SqlServer module si no está
+      if (-not (Get-Module -ListAvailable -Name SqlServer)) { Install-Module SqlServer -Force }
+
+      $query = @"
+      SELECT s.name AS schema_name, t.name AS table_name, SUM(p.rows) AS row_count
+      FROM sys.tables t JOIN sys.schemas s ON t.schema_id = s.schema_id
+      LEFT JOIN sys.partitions p ON p.object_id = t.object_id AND p.index_id IN (0, 1)
+      WHERE t.is_ms_shipped = 0 AND (t.name LIKE '%temp%' OR t.name LIKE '%tmp%')
+      GROUP BY s.name, t.name ORDER BY row_count DESC, s.name, t.name;
+      "@
+
+      # Conectar y ejecutar (usa Managed Identity o credenciales)
+      $results = Invoke-Sqlcmd -ServerInstance $(serverName) -Database $(databaseName) -Query $query -AccessToken (Get-AzAccessToken -ResourceUrl "https://database.windows.net/").Token  # O -Username/-Password
+
+      # Convertir a HTML table
+      $htmlBody = $results | ConvertTo-Html -Head '<style>table {border-collapse:collapse;} th,td {border:1px solid #ddd;padding:8px;}</style>' -Property schema_name,table_name,row_count | Out-String
+
+      # Enviar email
+      Send-MailMessage -To $(emailTo) -From $(smtpUser) -Subject "Tablas temp/tmp - $(Get-Date -Format 'yyyy-MM-dd')" -Body $htmlBody -BodyAsHtml -SmtpServer $(smtpServer) -Port $(smtpPort) -UseSsl -Credential (New-Object PSCredential($(smtpUser), (ConvertTo-SecureString $(SMTP_PASS) -AsPlainText -Force)))
